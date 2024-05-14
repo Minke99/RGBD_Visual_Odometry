@@ -83,16 +83,48 @@ class FeatureDetectionROS():
 
     def estimate_trans(self, Q1, Q2, R1, deltaR):
 
-        Q1COM = np.mean(Q1, axis=0)
-        Q2COM = np.mean(Q2, axis=0)
+        def ransac_translation(Q1, Q2, num_iterations=1000, threshold=0.1):
+            """
+            使用RANSAC算法来估计并过滤在只有平移运动的情况下的3D点对。
+            - num_iterations: int, RANSAC的迭代次数。
+            - threshold: float, 确定内点的距离阈值。
+            return:
+            - best_translation: 最好的平移向量估计。
+            - inliers: 内点的布尔索引数组。
+            """
+            best_inlier_count = 0
+            best_translation = None
+            best_inliers = None
 
-        # print("\nOriginal CoM1:", Q1COM)
-        # print("Original CoM2:", Q2COM)
+            n_points = Q1.shape[0]
 
-        RQ2COM = np.dot(deltaR, Q2COM)
-        # print("Rotated CoM2:", RQ2COM)
+            for _ in range(num_iterations):
+                # 随机选择一个点对来估计模型
+                idx = np.random.randint(0, n_points)
+                translation_estimate = Q2[idx] - Q1[idx]
 
-        offset = np.dot(R1, (Q1COM - RQ2COM))
+                # 计算所有点对的平移向量
+                estimated_Q2 = Q1 + translation_estimate
+                distances = np.linalg.norm(estimated_Q2 - Q2, axis=1)
+                
+                # 确定内点
+                inliers = distances < threshold
+                
+                # 更新最好的模型
+                inlier_count = np.sum(inliers)
+                if inlier_count > best_inlier_count:
+                    best_inlier_count = inlier_count
+                    best_translation = translation_estimate
+                    best_inliers = inliers
+
+            return best_translation, best_inliers
+        
+        RQ2 = np.dot(deltaR, Q2)
+        offset, inliers = ransac_translation(Q1, RQ2)
+        
+        # Q1COM = np.mean(Q1, axis=0)
+        # Q2COM = np.mean(Q2, axis=0)
+        # offset = np.dot(R1, (Q1COM - RQ2COM))
         print(f"Trans Direction: [{offset[0]:>7.1f}, {offset[1]:>7.1f}, {offset[2]:>7.1f}], Num Points:{np.shape(Q1)[0]}")
 
         return offset
@@ -158,12 +190,10 @@ class FeatureDetectionROS():
     def get_tiled_keypoints(self, img, tile_h, tile_w):
         """
         Splits the image into tiles and detects the 10 best keypoints in each tile
-
         ----------
         img (ndarray): The image to find keypoints in. Shape (height, width)
         tile_h (int): The tile height
         tile_w (int): The tile width
-
         -------
         kp_list (ndarray): A 1-D list of all keypoints. Shape (n_keypoints)
         """
@@ -196,13 +226,9 @@ class FeatureDetectionROS():
     def track_keypoints(self, img1, img2, kp1, max_error=4):
         """
         Tracks the keypoints between frames
-
         ----------
-        img1 (ndarray): i-1'th image. Shape (height, width)
-        img2 (ndarray): i'th image. Shape (height, width)
         kp1 (ndarray): Keypoints in the i-1'th image. Shape (n_keypoints)
         max_error (float): The maximum acceptable error
-
         -------
         trackpoints1 (ndarray): The tracked keypoints for the i-1'th image. Shape (n_keypoints_match, 2)
         trackpoints2 (ndarray): The tracked keypoints for the i'th image. Shape (n_keypoints_match, 2)
