@@ -14,12 +14,18 @@ from sensor_msgs.msg import Image ,CompressedImage
 # from sensor_msgs.msg import Image as msg_Image
 import message_filters
 from cv_bridge import CvBridge
+from geometry_msgs.msg import Point, Pose, PoseArray
+from nav_msgs.msg import Path
+from geometry_msgs.msg import PoseStamped
+
 
 import subprocess
 import time
 import threading
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
+from mpl_toolkits.mplot3d import Axes3D
+
 
 class FeatureDetectionROS():
 
@@ -28,14 +34,20 @@ class FeatureDetectionROS():
         self.rgb_sub = message_filters.Subscriber("/camera/color/image_raw", Image, queue_size=1, buff_size=9000000)
         # self.rgb_sub = message_filters.Subscriber("/camera/color/image_raw/compressed", CompressedImage, queue_size=1, buff_size=10000)
         self.depth_sub = message_filters.Subscriber("/camera/aligned_depth_to_color/image_raw", Image, queue_size=1, buff_size=9000000)
-        self.ts = message_filters.ApproximateTimeSynchronizer([self.rgb_sub , self.depth_sub], 10, 150)
+        self.ts = message_filters.ApproximateTimeSynchronizer([self.rgb_sub , self.depth_sub], 1, 1)
         self.ts.registerCallback(self.frame_callback)
         self.bridge = CvBridge()
 
         self.featured_im_pub = rospy.Publisher('featured_image', Image, queue_size=10)
+        # 创建用于发布轨迹的publisher
+        self.path_pub = rospy.Publisher('/vo_path', Path, queue_size=10)
+        # 初始化用于存储轨迹的Path
+        self.path = Path()
+        self.path.header.frame_id = 'map'  # 通常为'map'或'odom'
+        self.current_position = [0.0, 0.0, 0.0]  # X, Y, Z
         # Pub detection infor and modified image out
         # self.yolo_pub = rospy.Publisher('people', Float32MultiArray, queue_size=1)
-        
+
         # Intrensics
         self.K = np.array([
                             [605.2021484375, 0.0, 323.37109375],
@@ -43,7 +55,7 @@ class FeatureDetectionROS():
                             [0.0, 0.0, 1.0]
                         ])
         self.fastFeatures = cv2.FastFeatureDetector_create()
-        
+
         self.lk_params = dict(winSize=(15, 15),
                               flags=cv2.MOTION_AFFINE,
                               maxLevel=3,
@@ -54,7 +66,7 @@ class FeatureDetectionROS():
 
         self.last_im = []
         self.last_dep = []
-        
+
         print('finish init')
         rospy.spin()
 
@@ -73,9 +85,11 @@ class FeatureDetectionROS():
             self.last_dep = depth
             print('init frame')
         else:
-            kp1 = self.get_tiled_keypoints(self.last_im, 10, 20)
+            h, w, *_ = img.shape
+            kp1 = self.get_tiled_keypoints(self.last_im, 64, 48)
             tp1, tp2 = self.track_keypoints(self.last_im, img, kp1)
             Q1, Q2 = self.calc_3d(tp1, self.last_dep, tp2, depth)
+            Q1, Q2 = self.filter_far(Q1, Q2, 200)
             offset = self.estimate_trans(Q1, Q2, R1, deltaR)
             self.last_im = img
             self.last_dep = depth
@@ -83,52 +97,83 @@ class FeatureDetectionROS():
 
     def estimate_trans(self, Q1, Q2, R1, deltaR):
 
-        def ransac_translation(Q1, Q2, num_iterations=1000, threshold=0.1):
-            """
-            使用RANSAC算法来估计并过滤在只有平移运动的情况下的3D点对。
-            - num_iterations: int, RANSAC的迭代次数。
-            - threshold: float, 确定内点的距离阈值。
-            return:
-            - best_translation: 最好的平移向量估计。
-            - inliers: 内点的布尔索引数组。
-            """
-            best_inlier_count = 0
-            best_translation = None
-            best_inliers = None
+        def ransac_translation(Q1, Q2, sample_ratio=0.4, num_iterations=500, std_dev_factor=1):
+            if Q1.size == 0 or Q2.size == 0:
+                raise ValueError("Input arrays Q1 and Q2 must not be empty.")
 
             n_points = Q1.shape[0]
+            if n_points == 0:
+                raise ValueError("Input arrays Q1 and Q2 must contain points.")
+
+            num_samples = int(n_points * sample_ratio)
+            translations = []
 
             for _ in range(num_iterations):
-                # 随机选择一个点对来估计模型
-                idx = np.random.randint(0, n_points)
-                translation_estimate = Q2[idx] - Q1[idx]
+                # 随机选择数据点的索引
+                indices = np.random.choice(n_points, num_samples, replace=False)
+                sample_Q1 = Q1[indices]
+                sample_Q2 = Q2[indices]
 
-                # 计算所有点对的平移向量
-                estimated_Q2 = Q1 + translation_estimate
-                distances = np.linalg.norm(estimated_Q2 - Q2, axis=1)
-                
-                # 确定内点
-                inliers = distances < threshold
-                
-                # 更新最好的模型
-                inlier_count = np.sum(inliers)
-                if inlier_count > best_inlier_count:
-                    best_inlier_count = inlier_count
-                    best_translation = translation_estimate
-                    best_inliers = inliers
+                # 计算所有选定点对的平均位移
+                sample_translations = sample_Q2 - sample_Q1
+                mean_translation = np.mean(sample_translations, axis=0)
+                std_dev = np.std(sample_translations, axis=0)
 
-            return best_translation, best_inliers
+                # 筛选出与平均位移在一定标准差范围内的位移
+                valid_translations = sample_translations[np.all(np.abs(sample_translations - mean_translation) < std_dev_factor * std_dev, axis=1)]
+                if valid_translations.size > 0:
+                    translations.extend(valid_translations.tolist())
+
+            # 将收集到的所有有效位移转换为numpy数组，便于计算
+            if translations:
+                translations = np.array(translations)
+                final_translation = np.mean(translations, axis=0)
+            else:
+                raise Exception("No valid translations were found. Try adjusting the parameters.")
+
+            return final_translation
         
-        RQ2 = np.dot(deltaR, Q2)
-        offset, inliers = ransac_translation(Q1, RQ2)
+        # RQ2 = np.dot(deltaR, Q2)
+        Q2_transposed = Q2.T
+        RQ2_transposed = np.dot(deltaR, Q2_transposed)
+        RQ2 = RQ2_transposed.T
+        try:
+            offset = ransac_translation(Q1, RQ2)
+        except:
+            offset=[0,0,0]
         
-        # Q1COM = np.mean(Q1, axis=0)
-        # Q2COM = np.mean(Q2, axis=0)
+        Q1COM = np.mean(Q1, axis=0)
+        Q2COM = np.mean(RQ2, axis=0)
+        print(f"Q1COM [{Q1COM[0]:>7.1f},{Q1COM[1]:>7.1f}, {Q1COM[2]:>7.1f}] Q2COM [{Q2COM[0]:>7.1f},{Q2COM[1]:>7.1f},{Q2COM[2]:>7.1f}]")
         # offset = np.dot(R1, (Q1COM - RQ2COM))
         print(f"Trans Direction: [{offset[0]:>7.1f}, {offset[1]:>7.1f}, {offset[2]:>7.1f}], Num Points:{np.shape(Q1)[0]}")
-
+        if np.shape(Q1)[0] >20:
+            self.publish_trajectory(offset)
         return offset
-        
+    
+    def publish_trajectory(self, offset):
+        # 累积相对位移以更新当前位置
+        self.current_position[0] += offset[0]
+        self.current_position[1] += offset[1]
+        self.current_position[2] += offset[2]
+
+        # 创建PoseStamped消息
+        pose_stamped = PoseStamped()
+        pose_stamped.header.stamp = rospy.Time.now()
+        pose_stamped.header.frame_id = 'map'
+        pose_stamped.pose.position.x = self.current_position[0]
+        pose_stamped.pose.position.y = self.current_position[1]
+        pose_stamped.pose.position.z = self.current_position[2]
+        pose_stamped.pose.orientation.w = 1.0  # 无旋转
+
+        # 将新的位姿加入路径
+        self.path.poses.append(pose_stamped)
+        self.path.header.stamp = rospy.Time.now()
+
+        # 发布路径
+        self.path_pub.publish(self.path)
+
+
     def calc_3d(self, tp1, dep1, tp2, dep2):
         """
         Returns
@@ -186,6 +231,19 @@ class FeatureDetectionROS():
         plt.show()
         input("Press Enter to continue...")
 
+    def filter_far(self, Q1, Q2, dis = 300):
+        # 确保 Q1 和 Q2 的形状相同
+        assert Q1.shape == Q2.shape, "Q1 and Q2 must have the same shape"
+        
+        # 找出 Q1 和 Q2 中第三个元素（index 2）超过 30 的点的索引
+        indices_to_keep = np.where((Q1[:, 2] <= dis) & (Q2[:, 2] <= dis))[0]
+        
+        # 过滤出保留的点
+        Q1_filtered = Q1[indices_to_keep]
+        Q2_filtered = Q2[indices_to_keep]
+        
+        return Q1_filtered, Q2_filtered
+
 
     def get_tiled_keypoints(self, img, tile_h, tile_w):
         """
@@ -203,6 +261,19 @@ class FeatureDetectionROS():
 
             # Detect keypoints
             keypoints = self.fastFeatures.detect(impatch)
+
+            # 创建 ORB 检测器，可以设置最大特征点数等参数
+            # orb = cv2.ORB_create(nfeatures=2000,  # 增加特征点的数量
+            #          scaleFactor=1.2,  # 调整金字塔的缩放系数，减小这个值可以增加图像金字塔的层数
+            #          edgeThreshold=10,  # 减小边缘阈值，允许靠近边缘的特征点被检测
+            #          fastThreshold=15,  # 降低 FAST 检测器的阈值，使其更敏感
+            #          scoreType=cv2.ORB_HARRIS_SCORE)  # 改用 Harris score 来改善特征点的质量和稳定性
+            # # 检测关键点和计算描述子
+            # orb_keypoints, orb_descriptors = orb.detectAndCompute(impatch, None)
+            # # 合并从 ORB 和 FAST 得到的关键点
+            # keypoints = keypoints + orb_keypoints
+            # print(len(orb_keypoints))
+
 
             # Correct the coordinate for the point
             for pt in keypoints:
@@ -222,11 +293,13 @@ class FeatureDetectionROS():
         # Flatten the keypoint list
         kp_list_flatten = np.concatenate(kp_list)
         return kp_list_flatten
-        
-    def track_keypoints(self, img1, img2, kp1, max_error=4):
+
+    def track_keypoints(self, img1, img2, kp1, max_error=10):
         """
         Tracks the keypoints between frames
         ----------
+        img1 (ndarray): i-1'th image. Shape (height, width)
+        img2 (ndarray): i'th image. Shape (height, width)
         kp1 (ndarray): Keypoints in the i-1'th image. Shape (n_keypoints)
         max_error (float): The maximum acceptable error
         -------
@@ -257,8 +330,11 @@ class FeatureDetectionROS():
         trackpoints2 = trackpoints2[in_bounds]
 
         # self.plot_tracking(img1, img2, trackpoints1, trackpoints2)
-        self.draw_keypoints_and_lines(img2, trackpoints2)
-        
+        # Prepare lines to draw between matched keypoints
+        lines = list(zip(trackpoints1, trackpoints2))
+        # Draw keypoints and lines on the image
+        self.draw_keypoints_and_lines(img2, trackpoints2, lines)
+
         return trackpoints1, trackpoints2
 
     def draw_keypoints_and_lines(self, img, keypoints, lines=None):
@@ -270,6 +346,8 @@ class FeatureDetectionROS():
                 cv2.line(img, (int(pt1[0]), int(pt1[1])), (int(pt2[0]), int(pt2[1])), (0, 255, 255), 2)
         img_msg = self.bridge.cv2_to_imgmsg(img, "bgr8")
         self.featured_im_pub.publish(img_msg)
+        # if (len(keypoints)<3):
+        #     input("Press Enter to continue...")
         return img
 
 
